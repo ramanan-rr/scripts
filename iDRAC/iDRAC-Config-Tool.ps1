@@ -1,12 +1,26 @@
-# v1.1 2025-03-02
+# v2.0 2025-03-05
 # This is a script to configure iDRAC on new servers
 # Meant for SG CSC. Not for production use.
 # Created by Ramanan Raghuraman (ramanan.raghuraman@dell.com) on 2025-02-25
 
 # CAUTION: **** THIS SCRIPT WILL REBOOT THE SERVERS ****
 
-##### Known issues ######
-# 1. Menu items 2-4 don't work
+############## Release notes ##############
+#
+# v2.0 2025-03-05
+#    Added functionality to attach virtual media from remote file share (HTTP/NFS/CIFS) and reboot the server
+#    Added functionality to detach remote file share virtual media in iDRAC
+#    Other minor bugfixes
+#
+# v1.1 2025-03-02
+#    Updated script to check and report errors when running the configuration commands using racadm
+#
+# v1.0 2025-02
+#    Intial release with Configure New Idrac process
+#
+###########################################
+
+
 
 # Function to validate if the input is a valid IP address
 
@@ -24,10 +38,12 @@ function Display-Menu {
         Write-Host "2. Update iDRAC Hostname"
 		Write-Host "3. Add Local User to iDRAC"
 		Write-Host "4. Configure AD on iDRAC"
-		Write-Host "5. Quit"
+        Write-Host "5. Attach Virtual Media from Network Share ISO and reboot"
+        Write-Host "6. Detach ISO from Virtual Media"
+		Write-Host "7. Quit"
 		Write-Host ""
 		$operation = Read-Host "Please choose one option"
-	} while ($operation -ne "1" -and $operation -ne "2" -and $operation -ne "3" -and $operation -ne "4" -and $operation -ne "5")
+	} while ($operation -notmatch "^[1-7]$")
 	return [int]$operation
 }
 
@@ -152,6 +168,26 @@ function Get-Passwords {
     return @($currentRootPassword, $newRootPassword)
 }
 
+function Get-UserAndPw {
+
+    param (
+        [string]$component
+    )
+
+    # Get the username - can match alphanumeric characeters and also . _ - @ ~ \ or /
+    while (($input = Read-Host "$component Username") -notmatch '^[a-zA-Z0-9._\-@~/\\]+$') {
+        Write-Host "*** Invalid Value ($input) - please input a valid username ***"
+    }
+    $uname = $input
+
+    while (($input = Read-Host "$component Password") -notmatch "^[\x20-\x7E]+$") {
+        Write-Host "*** Invalid Value ($input) - Please input a valid password ***"
+    }
+    $pwd = $input
+
+    return @($uname, $pwd)
+}
+
 function Get-HostnameParams {
     # Get the information required to set the hostname correctly
     while (($input = Read-Host "Location of Server - Room (poc = p, demo = d)") -notmatch "^[pdPD]$") {
@@ -242,6 +278,56 @@ function Get-DnsNtpLdap {
     #}
 
     return @($dns1, $dns2, $ntp1, $ntp2, $ldap)
+}
+
+function Get-FileShare {
+    
+    Write-Host ""
+    Write-Host "iDRAC supports CIFS, NFS, HTTP and HTTPS protocols - see the valid formats below:"
+    Write-Host -nonewline -ForegroundColor Yellow "`tCIFS: "
+    Write-Host "//<server name or IP>/path/filename"
+    Write-Host -nonewline -ForegroundColor Yellow "`tNFS: "
+    Write-Host "<server name or IP>:/path/filename"
+    Write-Host -nonewline -ForegroundColor Yellow "`tHTTP: "
+    Write-Host "http[s]://<server name or IP>/path/filename"
+    Write-Host "Do not use backslash '\' character"
+    Write-Host ""
+    do {
+        $input = Read-Host "Fileshare path"
+        if ($input -match "^https?:\/\/[^\s/$.?#].[^\s]*$") {
+            $type = "http"
+            $path = $input
+            break
+        }
+        elseif ($input -match "^(//)[a-zA-Z0-9._\-]+(/[a-zA-Z0-9._\-~]+)*/?$") {
+            $type = "cifs"
+            $path = $input
+            break
+        }
+        elseif ($input -match "^[a-zA-Z0-9._\-]+:(/[a-zA-Z0-9._\-~]+)+$") {
+            $type = "nfs"
+            $path = $input
+            break
+        }
+        else {
+            Write-Host "*** Invalid Value ($input) - please input a valid remote file path"
+        }
+    } while ($true)
+
+    if ($type -eq "http") {
+        return @($type, $path, $null, $null)
+    }
+    elseif ($type -eq "nfs") {
+        $userpw = Get-UserAndPw -component "NFS share"
+    }
+    elseif ($type -eq "cifs") {
+        $userpw = Get-UserAndPw -component "CIFS share"
+    }
+    else {
+        Write-Host -ForegroundColor Red "Unexpected Error!"
+    }
+
+    return @($type, $path, $userpw[0], $userpw[1])
 }
 
 function Configure-RootPassword {
@@ -383,12 +469,45 @@ function Configure-BiosTimezone {
     Write-Host -ForegroundColor Yellow "Setting BIOS Timezone to UTC+8 on Server $idracIp"
     $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "set bios.miscsettings.timezone UTCP0800")
     $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "jobqueue create BIOS.Setup.1-1")
-    Write-Host -ForegroundColor Yellow "Rebooting server $idracIp"
-    $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "serveraction powercycle")
 
+    if (isError -gt 0) {
+        Write-Host -ForegroundColor Red "Errors encountered setting BIOS Timezone on $idracIP. Skipping server reboot"
+    }
+    else {
+        Write-Host -ForegroundColor Yellow "Rebooting server $idracIp"
+        $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "serveraction powercycle")
+    }
     return $isError
 }
 
+function Configure-FileShare {
+    param (
+        [string]$idracIp,
+        [string]$idracUname,
+        [string]$idracPwd,
+        [string]$shareType,
+        [string]$sharePath,
+        [string]$shareUname,
+        [string]$sharePw
+    )
+
+    $isError = 0
+
+    Write-Host -ForegroundColor Yellow "Setting remote share to $sharePath on Server $idracIp"
+    $isError += (Update-Idrac -ip $idracIp -uname $idracUname -pw $idracPwd -command "remoteimage -c -u $shareUname -p $sharePw -l $sharePath")
+    $isError += (Update-Idrac -ip $idracIp -uname $idracUname -pw $idracPwd -command "set iDRAC.VirtualMedia.BootOnce 1")
+    $isError += (Update-Idrac -ip $idracIp -uname $idracUname -pw $idracPwd -command "set iDRAC.ServerBoot.FirstBootDevice VCD-DVD")
+
+    if ($isError -gt 0) {
+        Write-Host -ForegroundColor Red "Errors encountered setting remote share path on $idracIP. Skipping server reboot"
+    }
+    else {
+        Write-Host -ForegroundColor Yellow "Rebooting server $idracIp"
+        $isError += (Update-Idrac -ip $idracIp -uname $idracUname -pw $idracPwd -command "serveraction powercycle")
+    }
+
+    return $isError
+}
 
 function Configure-Idrac {
 
@@ -490,6 +609,121 @@ function Configure-Idrac {
 
 }
 
+function Configure-AttachVirtualMedia {
+    Write-Host "`n`n"
+    Write-Host "This operation will perform the following tasks:"
+    Write-Host "`t-Attach an ISO file to the Remote File Share 1 of the iDRAC"
+    Write-Host "`t-Set the server to do a one-shot boot from the Virtual CD/DVD Drive"
+    Write-Host "`t-Powercycle the server to let it boot into the mounted ISO"
+    Write-Host "`n`n"
+
+    do {
+        # Get Range of IPs for the iDRACs to configure
+	    $idracArray = Get-idracIps
+        $idracUnamePw = Get-UserAndPw -component "iDRAC"
+        $shareInfo = Get-Fileshare
+        
+        Write-Host "`n`n`n"
+        Write-Host "The following configuration values will be used:"
+        Write-Host -NoNewline "`tServer IPs: "
+        foreach ($idrac in $idracArray) {
+            Write-Host -NoNewline "$idrac, "
+        }
+        Write-Host ""
+        Write-Host "`tiDRAC Username: $($idracUnamePw[0])"
+        Write-Host "`tiDRAC Password: $($idracUnamePw[1])"
+        Write-Host "`tPath to ISO: $($shareInfo[1])"
+        Write-Host "`tFileshare Username: $($shareInfo[2])"
+        Write-Host "`tFileshare Password: $($shareInfo[3])"
+        Write-Host ""
+        $input = Read-Host "Is this correct (y/n)"
+    } while (($input -ne "y") -and ($input -ne "Y")) 
+
+    
+    $numErrors = 0
+    foreach ($idrac in $idracArray) {
+        Write-Host ""
+        Write-Host ""
+        Write-Host -ForegroundColor Cyan  "Starting Processing $idrac"
+        Write-Host "---------------------------------------"
+        Write-Host ""
+        
+        $numErrors += Configure-FileShare -idracIp $idrac -idracUname $idracUnamePw[0] -idracPwd $idracUnamePw[1] -shareType $shareInfo[0] -sharePath $shareInfo[1] -shareUname $shareInfo[2] -sharePw $shareInfo[3]
+    }
+
+    Write-Host ""
+    Write-Host ""
+    if ($numErrors -gt 0) {
+        Write-Host -ForegroundColor Yellow "--------------------------------------------------------------------------------------------------"
+        Write-Host -ForegroundColor Yellow "# Operation completed with a total of $numErrors Error(s). Refer to $logfile for more details #"
+        Write-Host -ForegroundColor Yellow "--------------------------------------------------------------------------------------------------"
+    }
+    else {
+        Write-Host -ForegroundColor Green "-------------------------------------"
+        Write-Host -ForegroundColor Green "# Operation completed successfully! #"
+        Write-Host -ForegroundColor Green "-------------------------------------"
+    }
+
+    Write-Host
+    $null = Read-Host "Press Enter to Continue"
+    Write-Host
+}
+
+function Configure-DetachVirtualMedia {
+    Write-Host "`n`n"
+    Write-Host "This operation will perform the following tasks:"
+    Write-Host "`t-Detach the Remote File Share mounted as Virtual Media on the iDRAC"
+    Write-Host "`n`n"
+
+    do {
+        # Get Range of IPs for the iDRACs to configure
+	    $idracArray = Get-idracIps
+        $idracUnamePw = Get-UserAndPw -component "iDRAC"
+        
+        Write-Host "`n`n`n"
+        Write-Host "The following configuration values will be used:"
+        Write-Host -NoNewline "`tServer IPs: "
+        foreach ($idrac in $idracArray) {
+            Write-Host -NoNewline "$idrac, "
+        }
+        Write-Host ""
+        Write-Host "`tiDRAC Username: $($idracUnamePw[0])"
+        Write-Host "`tiDRAC Password: $($idracUnamePw[1])"
+        Write-Host ""
+        $input = Read-Host "Is this correct (y/n)"
+    } while (($input -ne "y") -and ($input -ne "Y")) 
+
+    
+    $numErrors = 0
+    foreach ($idrac in $idracArray) {
+        Write-Host ""
+        Write-Host ""
+        Write-Host -ForegroundColor Cyan  "Starting Processing $idrac"
+        Write-Host "---------------------------------------"
+        Write-Host ""
+        
+        $numErrors += Update-Idrac -ip $idrac -uname $idracUnamePw[0] -pw $idracUnamePw[1] -command "remoteimage -d"
+    }
+
+    Write-Host ""
+    Write-Host ""
+    if ($numErrors -gt 0) {
+        Write-Host -ForegroundColor Yellow "--------------------------------------------------------------------------------------------------"
+        Write-Host -ForegroundColor Yellow "# Operation completed with a total of $numErrors Error(s). Refer to $logfile for more details #"
+        Write-Host -ForegroundColor Yellow "--------------------------------------------------------------------------------------------------"
+    }
+    else {
+        Write-Host -ForegroundColor Green "-------------------------------------"
+        Write-Host -ForegroundColor Green "# Operation completed successfully! #"
+        Write-Host -ForegroundColor Green "-------------------------------------"
+    }
+
+    Write-Host
+    $null = Read-Host "Press Enter to Continue"
+    Write-Host
+}
+
+
 
 ###### Main script entry point #######
 
@@ -506,13 +740,26 @@ do {
 			#Write-Host "Configuring New idrac"
 			Configure-Idrac
 		}
-        2 { Write-Host "Changing host name"
+        2 { 
+            Write-Host "Changing host name - Coming soon..."
         }
-		3 { Write-Host "Add new user to idrac" 
+		3 { 
+            Write-Host "Add new user to idrac - Coming soon..." 
         }
-		4 { Write-Host "Configure LDAP" 
+		4 { 
+            Write-Host "Configure LDAP - Coming soon..." 
         }
-		5 { Write-Host "Quitting..."; exit; 
+        5 {
+            #Write-Host "Attaching Network Share ISO to Virtual Media"
+            Configure-AttachVirtualMedia
+        }
+        6 {
+            #Write-Host "Detaching Network Share ISO from Virtual Media"
+            Configure-DetachVirtualMedia
+        }
+		7 {
+            Write-Host "Quitting..." 
+            exit
         }
 		default { Write-Host "Unexpected error: Please try again" 
         }
