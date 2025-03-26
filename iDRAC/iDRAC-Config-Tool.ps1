@@ -1,4 +1,4 @@
-# v2.0 2025-03-05
+# v2.1 2025-03-26
 # This is a script to configure iDRAC on new servers
 # Meant for SG CSC. Not for production use.
 # Created by Ramanan Raghuraman (ramanan.raghuraman@dell.com) on 2025-02-25
@@ -6,6 +6,9 @@
 # CAUTION: **** THIS SCRIPT WILL REBOOT THE SERVERS ****
 
 ############## Release notes ##############
+#
+# v2.1 2025-03-26
+#    Fixed "iserror" bug in setting BIOS timezone section
 #
 # v2.0 2025-03-05
 #    Added functionality to attach virtual media from remote file share (HTTP/NFS/CIFS) and reboot the server
@@ -470,7 +473,7 @@ function Configure-BiosTimezone {
     $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "set bios.miscsettings.timezone UTCP0800")
     $isError += (Update-Idrac -ip $idracIp -uname "root" -pw $rootPw -command "jobqueue create BIOS.Setup.1-1")
 
-    if (isError -gt 0) {
+    if ($isError -gt 0) {
         Write-Host -ForegroundColor Red "Errors encountered setting BIOS Timezone on $idracIP. Skipping server reboot"
     }
     else {
